@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 const BV_PASSKEY = 'canCX9lvC812oa4Y6HYf4gmWK5uszkZCKThrdtYkZqcYE';
 const BV_DISPLAY = '14883-en_us';
 
@@ -13,15 +12,13 @@ async function getBVName(marsha: string): Promise<string | null> {
     const data = await res.json();
     const name = data?.Results?.[0]?.Name;
     return (name && name.toUpperCase() !== marsha.toUpperCase()) ? name : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 export async function POST(req: NextRequest) {
   const { hotels } = await req.json();
 
-  // Step 1: Try BazaarVoice for hotel names (fast, accurate)
+  // Step 1: BazaarVoice names in parallel
   const withBV = await Promise.all(
     hotels.map(async (h: { marsha: string; level: string }) => {
       const bvName = await getBVName(h.marsha);
@@ -29,28 +26,27 @@ export async function POST(req: NextRequest) {
     })
   );
 
-  // Step 2: Single Claude call for ALL hotels - name (fallback) + country
-  const marshaList = withBV.map((h: { marsha: string; bvName: string | null }) =>
-    h.bvName
-      ? `${h.marsha} (known name: "${h.bvName}")`
-      : h.marsha
-  ).join(', ');
+  // Step 2: Claude for ALL hotels - name fallback + country in one call
+  // Return format: array with marsha, name, country
+  const hotelLines = withBV.map((h: { marsha: string; bvName: string | null }) =>
+    h.bvName ? `${h.marsha}: ${h.bvName}` : h.marsha
+  ).join('\n');
 
-  const prompt = `You are a Marriott hotel database. For each MARSHA code, return a JSON array with objects: "marsha", "name", "country".
+  const prompt = `For each Marriott MARSHA code below, provide hotel name and country.
+MARSHA codes where the name is already known are shown as "CODE: Name".
+For unknown ones, derive name from the IATA city code (first 3 chars).
 
-Rules:
-- "name": Use the provided known name if given. Otherwise derive from MARSHA code (first 3 chars = IATA city code).
-- "country": Country in English where the hotel is located. Use the hotel name and city to determine this accurately.
-- "url": https://www.marriott.com/ + lowercase MARSHA code
-- APEC region only (Asia Pacific excluding mainland China). Non-APEC hotels should still get correct country.
-- Return ONLY a valid JSON array, no markdown.
+Return a JSON array ONLY, each object: { "marsha": "XXXXX", "name": "Full Hotel Name", "country": "Country Name" }
+Use UPPERCASE for marsha values matching exactly the input codes.
+No markdown, no explanation.
 
-Hotels: ${marshaList}`;
+Hotels:
+${hotelLines}`;
 
   try {
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
+      max_tokens: 4000,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -58,21 +54,28 @@ Hotels: ${marshaList}`;
     const clean = text.replace(/```json|```/g, '').trim();
     const parsed: Array<{ marsha: string; name: string; country: string }> = JSON.parse(clean);
 
-    const results = parsed.map(p => {
-      const orig = hotels.find((h: { marsha: string; level: string }) => h.marsha === p.marsha) || {};
-      const bvEntry = withBV.find((h: { marsha: string; bvName: string | null }) => h.marsha === p.marsha);
+    // Build lookup by uppercase marsha
+    const lookup: Record<string, { name: string; country: string }> = {};
+    for (const p of parsed) {
+      lookup[p.marsha.toUpperCase()] = { name: p.name, country: p.country };
+    }
+
+    const results = withBV.map((h: { marsha: string; level: string; bvName: string | null }) => {
+      const key = h.marsha.toUpperCase();
+      const ai = lookup[key];
       return {
-        marsha: p.marsha || orig.marsha,
-        name: bvEntry?.bvName || p.name || orig.marsha,
-        country: p.country || 'Unknown',
-        url: `https://www.marriott.com/${(p.marsha || orig.marsha).toLowerCase()}`,
-        level: orig.level || 'Unknown',
+        marsha: h.marsha,
+        name: h.bvName || ai?.name || h.marsha,
+        country: ai?.country || 'Unknown',
+        url: `https://www.marriott.com/${h.marsha.toLowerCase()}`,
+        level: h.level,
       };
     });
 
     return NextResponse.json({ results });
   } catch (e) {
-    // Full fallback
+    const err = e instanceof Error ? e.message : String(e);
+    console.error('Anthropic error:', err);
     const results = withBV.map((h: { marsha: string; level: string; bvName: string | null }) => ({
       marsha: h.marsha,
       name: h.bvName || h.marsha,
@@ -80,6 +83,6 @@ Hotels: ${marshaList}`;
       url: `https://www.marriott.com/${h.marsha.toLowerCase()}`,
       level: h.level,
     }));
-    return NextResponse.json({ results });
+    return NextResponse.json({ results, error: err });
   }
 }
