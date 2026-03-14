@@ -1,37 +1,60 @@
 import { NextRequest, NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 export async function POST(req: NextRequest) {
   const { hotels } = await req.json();
-  const marshaList = hotels.map((h: { marsha: string }) => h.marsha).join(', ');
-  const prompt = `You are a Marriott hotel database expert. For each MARSHA code below, return a JSON array with objects having exactly these keys: "marsha", "name", "country", "url".
 
-Rules:
-- "name": official Marriott hotel name
-- "country": country name in English
-- "url": hotel page URL on marriott.com
-- Return ONLY a valid JSON array, no markdown, no explanation.
+  const results = await Promise.all(
+    hotels.map(async (h: { marsha: string; level: string }) => {
+      try {
+        const marshaLower = h.marsha.toLowerCase();
+        const res = await fetch(`https://www.marriott.com/${marshaLower}`, {
+          redirect: 'follow',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; MarshaCNAnalyzer/1.0)',
+            'Accept': 'text/html,application/xhtml+xml',
+          },
+          signal: AbortSignal.timeout(8000),
+        });
 
-MARSHA codes: ${marshaList}`;
+        const html = await res.text();
+        const finalUrl = res.url;
 
-  try {
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const text = (message.content[0] as { type: string; text: string }).text;
-    const clean = text.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-    const results = parsed.map((p: { marsha: string; name: string; country: string; url: string }) => {
-      const orig = hotels.find((h: { marsha: string; level: string }) => h.marsha === p.marsha) || {};
-      return { marsha: p.marsha || orig.marsha, name: p.name || orig.marsha, country: p.country || 'Unknown', url: p.url || '', level: orig.level || 'Unknown' };
-    });
-    return NextResponse.json({ results });
-  } catch {
-    const results = hotels.map((h: { marsha: string; level: string }) => ({ marsha: h.marsha, name: h.marsha, country: 'Unknown', url: '', level: h.level }));
-    return NextResponse.json({ results });
-  }
+        // Extract from JSON-LD structured data
+        const ldMatch = html.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
+        let name = h.marsha;
+        let country = 'Unknown';
+
+        if (ldMatch) {
+          const nameMatch = ldMatch[1].match(/"name"\s*:\s*"([^"]+)"/);
+          const countryMatch = ldMatch[1].match(/"addressCountry"\s*:\s*"([^"]+)"/);
+          if (nameMatch) name = nameMatch[1];
+          if (countryMatch) country = countryMatch[1];
+        }
+
+        // Fallback: extract from page title
+        if (name === h.marsha) {
+          const titleMatch = html.match(/<title>([^<|]+)/i);
+          if (titleMatch) name = titleMatch[1].trim();
+        }
+
+        return {
+          marsha: h.marsha,
+          name,
+          country,
+          url: finalUrl || `https://www.marriott.com/${marshaLower}`,
+          level: h.level,
+        };
+      } catch {
+        return {
+          marsha: h.marsha,
+          name: h.marsha,
+          country: 'Unknown',
+          url: `https://www.marriott.com/${h.marsha.toLowerCase()}`,
+          level: h.level,
+        };
+      }
+    })
+  );
+
+  return NextResponse.json({ results });
 }
